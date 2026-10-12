@@ -203,6 +203,7 @@ PYEOF
   #      也已被补丁移出编译列表，所以不再需要。）
   if [ -f "$FINASU_KSI" ] && grep -q '^void ksu_handle_execveat_ksud(const char \*path, struct user_arg_ptr \*argv)' "$FINASU_KSI"; then
     python3 - "$FINASU_KSI" <<'PYEOF'
+import os
 import sys
 
 path = sys.argv[1]
@@ -212,6 +213,27 @@ old_sig = "void ksu_handle_execveat_ksud(const char *path, struct user_arg_ptr *
 if old_sig not in src:
     print("ksud_integration.c: 未找到旧版 ksu_handle_execveat_ksud，跳过")
     sys.exit(0)
+
+# ksu_feature_apply_forced() 是新形态（preview1 起）才有的函数；旧形态源码里
+# 引用它会变成隐式声明并在 -Werror 下编译失败，所以按符号存在性决定是否插入。
+root = os.path.dirname(os.path.dirname(path))
+has_forced = False
+for dirpath, _dirs, files in os.walk(root):
+    for f in files:
+        if f == "ksud_integration.c" or not f.endswith((".c", ".h")):
+            continue
+        try:
+            with open(os.path.join(dirpath, f), encoding="utf-8", errors="ignore") as fh:
+                if "ksu_feature_apply_forced" in fh.read():
+                    has_forced = True
+                    break
+        except OSError:
+            pass
+    if has_forced:
+        break
+forced_call = "                ksu_feature_apply_forced();\n" if has_forced else ""
+print("ksud_integration.c: ksu_feature_apply_forced 存在=%s，%s该调用" % (has_forced, "保留" if has_forced else "跳过"))
+
 start = src.index(old_sig)
 end = src.index("\n}\n", start) + len("\n}\n")
 
@@ -247,7 +269,7 @@ new_func = (
     "                apply_kernelsu_rules();\n"
     "                cache_sid();\n"
     "                setup_ksu_cred();\n"
-    "                ksu_feature_apply_forced();\n"
+    + forced_call +
     "                static_branch_disable(&is_init_second_stage_not_executed);\n"
     "            }\n"
     "        }\n"
