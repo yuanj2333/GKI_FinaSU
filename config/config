@@ -26,3 +26,9 @@ gki-android16-6.12=
 # ==================== SukiSU 的 commit hash ====================
 # 仅当 custom=true 且使用 SukiSU 变体时生效
 sukisu=
+
+# ==================== FinaSU 固定版本 ====================
+# 固定 LyraVoid/FinaSU 的 tag 或 commit；留空/删除该行 = 自动跟随最新 Release。
+# 目前固定 v0.1.0-beta5：v0.1.0-preview1 起的新版 selinux_hide 与 SUSFS4KSU 的
+# KSU 侧补丁及本仓库 FinaSU 适配脚本不兼容，会导致「应用 SUSFS 补丁」失败。
+finasu_ref=v0.1.0-beta5
