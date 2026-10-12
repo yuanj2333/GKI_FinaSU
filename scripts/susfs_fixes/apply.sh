@@ -104,23 +104,38 @@ if [ "$KSU_VARIANT" == "FinaSU" ]; then
   #     保持 false，SUSFS 内核代码里 !ksu_selinux_hide_running 的分支就会跳过伪装，
   #     表现为「隐藏 SELinux 失效」。这里按 SUSFS 设计，让 selinux_hide.c 只提供共享符号，
   #     不再安装运行时 hook。
+  # selinux_hide 形态检测（在 0c 之前，此时文件已回退为上游原版）：
+  #   新形态（preview1+）无 fake_state，0c 不能再注入 fake_state.initialized/policy，校验也跳过 fake_state 项
+  NEW_MODEL=0
+  if [ -f "$FINASU_SELINUX_HIDE" ] && ! grep -q 'fake_state' "$FINASU_SELINUX_HIDE"; then
+    NEW_MODEL=1
+  fi
+  echo "FinaSU selinux_hide 形态: $([ "$NEW_MODEL" = 1 ] && echo 新 || echo 旧)"
+
   if ! grep -q 'FINASU_SUSFS_OWNS_SELINUXFS' "$FINASU_SELINUX_HIDE"; then
-    python3 - "$FINASU_SELINUX_HIDE" <<'PYEOF'
+    python3 - "$FINASU_SELINUX_HIDE" "${NEW_MODEL:-0}" <<'PYEOF'
 import sys
 
 path = sys.argv[1]
+new_model = (sys.argv[2] == "1")
 src = open(path, encoding="utf-8").read()
 
-# enable(): 在安装 write_op/status/setprocattr hook 之前直接返回，仅保留 <6.6 的 fake_state 设置
+# enable(): 在安装 write_op/status/setprocattr hook 之前直接返回；
+# 旧形态另需保留 <6.6 的 fake_state 设置，新形态没有 fake_state（统一用 backup_sepolicy）
 enable_anchor = '    selinux_write_op = find_kernel_symbol_exact("write_op");'
 assert src.count(enable_anchor) == 1, "selinux_hide enable anchor not unique"
 enable_block = (
     "#ifdef CONFIG_KSU_SUSFS\n"
     "    /* FINASU_SUSFS_OWNS_SELINUXFS: SUSFS 已接管 write_op/status/setprocattr */\n"
-    "#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 6, 0)\n"
-    "    fake_state.initialized = true;\n"
-    "    fake_state.policy = backup_sepolicy;\n"
-    "#endif\n"
+)
+if not new_model:
+    enable_block += (
+        "#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 6, 0)\n"
+        "    fake_state.initialized = true;\n"
+        "    fake_state.policy = backup_sepolicy;\n"
+        "#endif\n"
+    )
+enable_block += (
     "    return 0;\n"
     "#endif\n"
 )
