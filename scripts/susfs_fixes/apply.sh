@@ -54,6 +54,7 @@ if [ "$KSU_VARIANT" == "FinaSU" ]; then
   FINASU_KSU="$KERNEL_ROOT/KernelSU/kernel"
   FINASU_INIT="$FINASU_KSU/core/init.c"
   FINASU_KSU_H="$FINASU_KSU/include/ksu.h"
+  FINASU_KSI="$FINASU_KSU/runtime/ksud_integration.c"
   if [ ! -f "$FINASU_INIT" ] || [ ! -f "$FINASU_KSU_H" ]; then
     echo "::error::未找到 FinaSU 内核源码文件 (core/init.c / include/ksu.h)" >&2
     exit 1
@@ -192,6 +193,88 @@ PYEOF
     grep -n 'FINASU_SECCOMP_KEEP_FILTER\|ksu_seccomp_allow_cache(current->seccomp.filter' "$FINASU_KSU/hook/setuid_hook.c"
   fi
 
+  # 0e) 补齐 ksud_integration.c 的 exec 钩子新签名
+  #     simonpunk 的补丁把 exec 钩子改成 fd 版：ksud.h 的声明、sucompat.c 的
+  #     ksu_handle_execveat() 调用都已是新签名，但 ksud_integration.c 里改写该函数的 hunk
+  #     因 FinaSU 多了一行 ksu_feature_apply_forced() 而失败，于是定义仍是旧的
+  #     void(const char*, struct user_arg_ptr*) → 「conflicting types for
+  #     'ksu_handle_execveat_ksud'」。这里按补丁本意改写为 fd 版并保留 ksu_feature_apply_forced()。
+  #     （旧的 ksu_execve_hook_ksud 定义已被补丁删除，其调用点 hook/syscall_event_bridge.c
+  #      也已被补丁移出编译列表，所以不再需要。）
+  if [ -f "$FINASU_KSI" ] && grep -q '^void ksu_handle_execveat_ksud(const char \*path, struct user_arg_ptr \*argv)' "$FINASU_KSI"; then
+    python3 - "$FINASU_KSI" <<'PYEOF'
+import sys
+
+path = sys.argv[1]
+src = open(path, encoding="utf-8").read()
+
+old_sig = "void ksu_handle_execveat_ksud(const char *path, struct user_arg_ptr *argv)\n"
+if old_sig not in src:
+    print("ksud_integration.c: 未找到旧版 ksu_handle_execveat_ksud，跳过")
+    sys.exit(0)
+start = src.index(old_sig)
+end = src.index("\n}\n", start) + len("\n}\n")
+
+new_func = (
+    "extern int ksu_handle_execveat_init(struct filename *filename, struct user_arg_ptr *argv_user, struct user_arg_ptr *envp_user);\n"
+    "\n"
+    "// IMPORTANT NOTE: the call from execve_handler_pre WON'T provided correct value for envp and flags in GKI version\n"
+    "int ksu_handle_execveat_ksud(int *fd, struct filename **filename_ptr,\n"
+    "                             struct user_arg_ptr *argv,\n"
+    "                             struct user_arg_ptr *envp, int *flags)\n"
+    "{\n"
+    "    struct filename *filename;\n"
+    "    static const char app_process[] = \"/system/bin/app_process\";\n"
+    "\n"
+    "    /* This applies to versions Android 10+ */\n"
+    "    static const char system_bin_init[] = \"/system/bin/init\";\n"
+    "\n"
+    "    if (!filename_ptr)\n"
+    "        return 0;\n"
+    "\n"
+    "    filename = *filename_ptr;\n"
+    "    if (IS_ERR(filename)) {\n"
+    "        return 0;\n"
+    "    }\n"
+    "\n"
+    "    if (static_branch_unlikely(&is_init_second_stage_not_executed)) {\n"
+    "        // https://cs.android.com/android/platform/superproject/+/android-16.0.0_r2:system/core/init/main.cpp;l=77\n"
+    "        if (unlikely(!memcmp(filename->name, system_bin_init, sizeof(system_bin_init) - 1) && argv)) {\n"
+    "            char buf[16];\n"
+    "            if (check_argv(*argv, 1, \"second_stage\", buf, sizeof(buf))) {\n"
+    "                pr_info(\"/system/bin/init second_stage executed\\n\");\n"
+    "                ksu_selinux_hide_handle_second_stage();\n"
+    "                apply_kernelsu_rules();\n"
+    "                cache_sid();\n"
+    "                setup_ksu_cred();\n"
+    "                ksu_feature_apply_forced();\n"
+    "                static_branch_disable(&is_init_second_stage_not_executed);\n"
+    "            }\n"
+    "        }\n"
+    "    }\n"
+    "\n"
+    "    if (static_branch_unlikely(&is_first_zygote)) {\n"
+    "        if (unlikely(!memcmp(filename->name, app_process, sizeof(app_process) - 1) && argv)) {\n"
+    "            char buf[16];\n"
+    "            if (check_argv(*argv, 1, \"-Xzygote\", buf, sizeof(buf))) {\n"
+    "                pr_info(\"exec zygote, /data prepared, second_stage: %d\\n\", !static_key_enabled(&is_init_second_stage_not_executed));\n"
+    "                on_post_fs_data();\n"
+    "                static_branch_disable(&is_first_zygote);\n"
+    "            }\n"
+    "        }\n"
+    "    }\n"
+    "\n"
+    "    return 0;\n"
+    "}\n"
+)
+
+src = src[:start] + new_func + src[end:]
+open(path, "w", encoding="utf-8").write(src)
+print("ksud_integration.c: 已按补丁本意把 ksu_handle_execveat_ksud 改写为 fd 版签名")
+PYEOF
+    grep -n '^int ksu_handle_execveat_ksud(int \*fd' "$FINASU_KSI"
+  fi
+
   # 1) 移除已不参与编译的模块的调用（仅剩 syscall hook / syscall hook manager）
   sed -i \
     -e '/^[[:space:]]*ksu_syscall_hook_init();$/d' \
@@ -274,7 +357,8 @@ KSU_KBUILD_EOF
     || ! grep -q '^void initialize_fake_status(void)$' "$FINASU_SELINUX_HIDE" \
     || ! grep -q '^int security_context_to_sid_with_policy' "$FINASU_SELINUX_HIDE" \
     || ! grep -q '^int security_sid_to_context_with_policy' "$FINASU_SELINUX_HIDE" \
-    || ! grep -q '^void security_compute_av_user_with_policy' "$FINASU_SELINUX_HIDE"; then
+    || ! grep -q '^void security_compute_av_user_with_policy' "$FINASU_SELINUX_HIDE" \
+    || ! grep -q '^int ksu_handle_execveat_ksud(int \*fd, struct filename \*\*filename_ptr,' "$FINASU_KSI"; then
     echo "::error::FinaSU 适配修复失败，代码结构可能已变化" >&2
     exit 1
   fi
